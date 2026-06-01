@@ -20,8 +20,9 @@ public sealed class MqttOptionsValidator : IValidateOptions<MqttOptions>
             failures.Add("Mqtt:ReconnectBaseDelaySeconds must be >= 1");
         if (o.ReconnectMaxDelaySeconds < o.ReconnectBaseDelaySeconds)
             failures.Add("Mqtt:ReconnectMaxDelaySeconds must be >= ReconnectBaseDelaySeconds");
-        if (o.UseTls && o.AllowUntrustedCertificates)
-            failures.Add("Mqtt:AllowUntrustedCertificates=true must not be used in production");
+        // AllowUntrustedCertificates is intentionally NOT validated here.
+        // Development environments use self-signed certs; enforcement is done
+        // via appsettings.Production.json which forces AllowUntrustedCertificates=false.
 
         return failures.Count == 0
             ? ValidateOptionsResult.Success

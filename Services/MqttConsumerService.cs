@@ -30,31 +30,28 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
 
     // ── Channel ──────────────────────────────────────────────────────────────
     private readonly Channel<MqttMessage> _channel;
-    private int _lastChannelOccupancy;   // protected by Interlocked in UpdateChannelMetrics
+    private int _lastChannelOccupancy;
 
     // ── Worker pool ───────────────────────────────────────────────────────────
-    // Workers use CancellationToken.None on ReadAllAsync so they drain the channel
-    // fully on shutdown. Scale-down is cooperative: a worker checks _targetWorkerCount
-    // before picking up each message and exits if there are too many workers.
     private readonly List<Task> _workers = [];
     private readonly SemaphoreSlim _workerLock = new(1, 1);
     private int _activeWorkerCount;
     private volatile int _targetWorkerCount;
 
-    // Stored once ExecuteAsync starts; passed to ProcessMessageAsync so long-running
-    // handlers can observe application shutdown without blocking the drain loop.
+    // Stored once ExecuteAsync starts; passed to handlers so they observe shutdown.
     private CancellationToken _stoppingToken;
 
+    // ── Scaler task ───────────────────────────────────────────────────────────
+    // Stored so DrainAsync can confirm it exited cleanly (Bug 2 fix).
+    private Task _scalerTask = Task.CompletedTask;
+
     // ── Resilience pipelines ──────────────────────────────────────────────────
-    // One pipeline per registered topic filter; key is the filter string.
-    // Each pipeline = Retry (exponential backoff) → CircuitBreaker.
     private readonly Dictionary<string, ResiliencePipeline> _pipelines = new();
     private static readonly ResiliencePropertyKey<string> TopicKey = new("mqtt.topic");
 
     // ── MQTT client ───────────────────────────────────────────────────────────
     private readonly IMqttClient _mqttClient;
 
-    // Signals ConnectLoopAsync that the broker disconnected.
     // Recreated at the start of each connection attempt (see ConnectLoopAsync).
     private volatile TaskCompletionSource<bool> _disconnectedTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -101,10 +98,13 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
     {
         _stoppingToken = stoppingToken;
 
-        var workerOpts = _workerOptsMonitor.CurrentValue;
-        await ScaleWorkersToAsync(workerOpts.InitialWorkerCount, stoppingToken);
+        await ScaleWorkersToAsync(_workerOptsMonitor.CurrentValue.InitialWorkerCount, stoppingToken);
 
-        _ = AdaptiveScalerAsync(stoppingToken);
+        // BUG FIX 2: Store the scaler task instead of fire-and-forget.
+        // RunScalerWithFaultLoggingAsync catches and logs any unexpected exception
+        // so a crash in the scaler is visible rather than silently swallowed.
+        _scalerTask = RunScalerWithFaultLoggingAsync(stoppingToken);
+
         await ConnectLoopAsync(stoppingToken);
         await DrainAsync();
     }
@@ -118,8 +118,6 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
 
         while (!ct.IsCancellationRequested)
         {
-            // Fresh TCS per attempt — the previous one stays completed after disconnect
-            // and would make WhenAny return immediately on the next iteration.
             _disconnectedTcs = new TaskCompletionSource<bool>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -129,18 +127,34 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
                     _mqttOpts.Host, _mqttOpts.Port, attempt + 1);
 
                 await _mqttClient.ConnectAsync(options, ct);
-                attempt = 0; // reset backoff counter on successful connect
+                attempt = 0;
 
+                // BUG FIX 4: Check the SUBACK result code for every subscription.
+                // A broker can grant a lower QoS than requested, or reject entirely.
+                // Throwing here triggers the reconnect loop so the client retries.
                 foreach (var filter in _router.RegisteredFilters)
                 {
-                    await _mqttClient.SubscribeAsync(
+                    var subResult = await _mqttClient.SubscribeAsync(
                         new MqttClientSubscribeOptionsBuilder()
                             .WithTopicFilter(filter, MqttQualityOfServiceLevel.AtLeastOnce)
                             .Build(), ct);
-                    _logger.LogInformation("Subscribed to {Filter}", filter);
+
+                    foreach (var item in subResult.Items)
+                    {
+                        if (item.ResultCode is not (MqttClientSubscribeResultCode.GrantedQoS0
+                            or MqttClientSubscribeResultCode.GrantedQoS1
+                            or MqttClientSubscribeResultCode.GrantedQoS2))
+                        {
+                            throw new InvalidOperationException(
+                                $"Broker rejected subscription to '{filter}': {item.ResultCode}. " +
+                                $"Check broker ACL configuration.");
+                        }
+
+                        _logger.LogInformation("Subscribed to {Filter} (granted QoS={QoS})",
+                            filter, item.ResultCode);
+                    }
                 }
 
-                // Block until disconnected or application stopping
                 await Task.WhenAny(_disconnectedTcs.Task, Task.Delay(Timeout.Infinite, ct));
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -149,7 +163,7 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "MQTT connection failed");
+                _logger.LogWarning(ex, "MQTT connection/subscription failed");
             }
 
             if (!ct.IsCancellationRequested)
@@ -186,30 +200,40 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
 
     private async Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
     {
-        // Backpressure: when the channel is near full, stop ACKing QoS ≥1 messages.
-        // The broker will hold and retransmit them, pushing pressure to the network layer.
+        // BUG FIX 3: Distinguish QoS=0 (no broker retransmit) from QoS≥1 under backpressure.
+        // QoS=0 is permanently lost if we don't process it now — log and count it.
+        // QoS≥1 is safe to NACK: the broker retains and retransmits after reconnect.
         if (_backpressureActive)
         {
-            e.AutoAcknowledge = false;
+            var topic = e.ApplicationMessage.Topic;
+            if (e.ApplicationMessage.QualityOfServiceLevel == MqttQualityOfServiceLevel.AtMostOnce)
+            {
+                _metrics.MessagesReceived.Add(1, new TagList { { "topic", topic } });
+                _metrics.MessagesFailed.Add(1, new TagList { { "topic", topic } });
+                _logger.LogWarning(
+                    "QoS=0 message permanently dropped on topic {Topic}: " +
+                    "backpressure active and broker will not retransmit",
+                    topic);
+            }
+            else
+            {
+                e.AutoAcknowledge = false;
+            }
             return;
         }
 
-        var topic         = e.ApplicationMessage.Topic;
+        var msgTopic      = e.ApplicationMessage.Topic;
         var correlationId = ExtractCorrelationId(e.ApplicationMessage);
 
-        using var receiveActivity = MqttActivitySource.StartReceive(topic, correlationId);
-
-        // Capture the ActivityContext struct while the span is still alive.
-        // The struct remains valid after the activity is disposed — it holds
-        // only the TraceId/SpanId/TraceFlags values needed to parent child spans.
+        using var receiveActivity = MqttActivitySource.StartReceive(msgTopic, correlationId);
         var parentContext = receiveActivity?.Context ?? default;
 
         var payload = e.ApplicationMessage.PayloadSegment.ToArray();
 
-        _metrics.MessagesReceived.Add(1, new TagList { { "topic", topic } });
+        _metrics.MessagesReceived.Add(1, new TagList { { "topic", msgTopic } });
 
         var message = new MqttMessage(
-            topic,
+            msgTopic,
             payload,
             e.ApplicationMessage.QualityOfServiceLevel,
             e.ApplicationMessage.Retain,
@@ -217,7 +241,7 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
             DateTimeOffset.UtcNow,
             parentContext);
 
-        using var enqueueActivity = MqttActivitySource.StartEnqueue(topic, correlationId);
+        using var enqueueActivity = MqttActivitySource.StartEnqueue(msgTopic, correlationId);
 
         await _channel.Writer.WriteAsync(message).ConfigureAwait(false);
         UpdateChannelMetrics();
@@ -231,14 +255,8 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         _metrics.WorkerCount.Add(1);
         try
         {
-            // CancellationToken.None: workers drain all remaining messages on shutdown.
-            // Per-message scale-down is cooperative (checked below).
             await foreach (var message in _channel.Reader.ReadAllAsync(CancellationToken.None))
             {
-                // Cooperative scale-down: if we have more workers than the current target,
-                // exit after finishing this message. Remaining messages are picked up by
-                // the surviving workers. During drain, _targetWorkerCount = int.MaxValue
-                // so no worker exits prematurely.
                 if (Volatile.Read(ref _activeWorkerCount) > Volatile.Read(ref _targetWorkerCount))
                     break;
 
@@ -269,7 +287,6 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         var pipeline = _pipelines.GetValueOrDefault(handler.TopicFilter)
                     ?? _pipelines["__default__"];
 
-        // Pass the topic through Polly context so OnRetry callbacks can log it
         var resilienceCtx = ResilienceContextPool.Shared.Get(ct);
         resilienceCtx.Properties.Set(TopicKey, message.Topic);
 
@@ -291,7 +308,6 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         }
         catch (BrokenCircuitException bcx)
         {
-            // Circuit is open — don't retry; route to DLC so the main pipeline keeps moving
             processActivity?.RecordException(bcx);
             _logger.LogWarning(bcx, "Circuit open for topic {Topic}, routing to dead-letter",
                 message.Topic);
@@ -299,7 +315,6 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // All Polly retries exhausted
             sw.Stop();
             _metrics.MessagesFailed.Add(1, new TagList { { "topic", message.Topic } });
             processActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
@@ -314,6 +329,27 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
 
     // ── Adaptive scaler ──────────────────────────────────────────────────────
 
+    // BUG FIX 2: Wrapper that logs any unexpected exception from the scaler.
+    // Without this, a NullReferenceException or any other fault silently kills
+    // scaling with no log, no metric, no indication anything went wrong.
+    private async Task RunScalerWithFaultLoggingAsync(CancellationToken ct)
+    {
+        try
+        {
+            await AdaptiveScalerAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Normal shutdown path — not an error
+        }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex,
+                "AdaptiveScaler stopped unexpectedly — worker pool will no longer scale " +
+                "automatically. Restart the service to restore adaptive scaling.");
+        }
+    }
+
     private async Task AdaptiveScalerAsync(CancellationToken ct)
     {
         using var timer = new PeriodicTimer(
@@ -321,7 +357,7 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
 
         while (!ct.IsCancellationRequested && await timer.WaitForNextTickAsync(ct))
         {
-            var opts     = _workerOptsMonitor.CurrentValue; // live config reload
+            var opts     = _workerOptsMonitor.CurrentValue;
             var capacity = opts.ChannelCapacity;
             var fill     = _channel.Reader.Count * 100 / Math.Max(1, capacity);
 
@@ -345,7 +381,6 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
                 _logger.LogInformation(
                     "Channel {Fill}% full – scaling down workers {Current} → {Target}",
                     fill, current, target);
-                // Write the new target; workers check it cooperatively before each message
                 Volatile.Write(ref _targetWorkerCount, target);
             }
         }
@@ -356,7 +391,10 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         await _workerLock.WaitAsync(ct);
         try
         {
-            // Prune completed tasks to prevent the list growing unboundedly
+            // Log any workers that faulted before pruning them
+            foreach (var faulted in _workers.Where(t => t.IsFaulted))
+                _logger.LogError(faulted.Exception, "A consumer worker task faulted unexpectedly");
+
             _workers.RemoveAll(t => t.IsCompleted);
 
             Volatile.Write(ref _targetWorkerCount, target);
@@ -375,20 +413,27 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
     {
         var workerOpts = _workerOptsMonitor.CurrentValue;
 
-        // Disable cooperative scale-down so every worker drains to completion
         Volatile.Write(ref _targetWorkerCount, int.MaxValue);
 
         _logger.LogInformation("Shutdown: draining {Count} messages from channel",
             _channel.Reader.Count);
 
-        // Signal workers that no more messages will arrive
         _channel.Writer.Complete();
+
+        // BUG FIX 1: Capture the worker list under the lock before handing it to
+        // Task.WhenAll. Without the lock, ScaleWorkersToAsync (running concurrently
+        // in the still-live scaler task) can call _workers.RemoveAll while WhenAll
+        // is iterating the same List<Task>, causing InvalidOperationException.
+        Task[] workerSnapshot;
+        await _workerLock.WaitAsync();
+        try { workerSnapshot = _workers.ToArray(); }
+        finally { _workerLock.Release(); }
 
         using var timeout = new CancellationTokenSource(
             TimeSpan.FromSeconds(workerOpts.ShutdownTimeoutSeconds));
         try
         {
-            await Task.WhenAll(_workers).WaitAsync(timeout.Token);
+            await Task.WhenAll(workerSnapshot).WaitAsync(timeout.Token);
             _logger.LogInformation("All workers drained cleanly");
         }
         catch (OperationCanceledException)
@@ -398,6 +443,10 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
                 workerOpts.ShutdownTimeoutSeconds,
                 _channel.Reader.Count);
         }
+
+        // Wait for the scaler to exit before tearing down resources it might touch
+        try { await _scalerTask.WaitAsync(TimeSpan.FromSeconds(2)); }
+        catch { /* scaler already logged any fault; don't block shutdown */ }
 
         if (_mqttClient.IsConnected)
             await _mqttClient.DisconnectAsync();
@@ -409,9 +458,6 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
     {
         ResiliencePipeline Build(string filterName) =>
             new ResiliencePipelineBuilder()
-                // Retry wraps the circuit breaker: failures are retried before CB records them.
-                // BrokenCircuitException is explicitly excluded from retry so a tripped CB
-                // immediately propagates to the catch block in ProcessMessageAsync.
                 .AddRetry(new Polly.Retry.RetryStrategyOptions
                 {
                     MaxRetryAttempts = opts.MaxRetries,
@@ -439,8 +485,7 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
                     BreakDuration     = TimeSpan.FromSeconds(opts.CircuitBreakerDurationSeconds),
                     OnOpened = args =>
                     {
-                        _logger.LogWarning(
-                            "Circuit OPENED for filter {Filter} (break {Dur}s)",
+                        _logger.LogWarning("Circuit OPENED for filter {Filter} (break {Dur}s)",
                             filterName, opts.CircuitBreakerDurationSeconds);
                         return ValueTask.CompletedTask;
                     },
@@ -462,7 +507,6 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
     private void UpdateChannelMetrics()
     {
         var current  = _channel.Reader.Count;
-        // Interlocked.Exchange returns the OLD value, giving us the delta atomically
         var previous = Interlocked.Exchange(ref _lastChannelOccupancy, current);
         var delta    = current - previous;
         if (delta != 0)
@@ -482,12 +526,11 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         return Guid.NewGuid().ToString("N");
     }
 
-    // Exponential backoff with ±20% jitter, capped at maxDelaySeconds.
     private static TimeSpan ExponentialBackoff(int attempt, int baseSeconds, int maxSeconds)
     {
         var raw    = baseSeconds * Math.Pow(2, attempt - 1);
         var capped = Math.Min(raw, maxSeconds);
-        var jitter = capped * 0.2 * (Random.Shared.NextDouble() - 0.5); // ±10%
+        var jitter = capped * 0.2 * (Random.Shared.NextDouble() - 0.5);
         return TimeSpan.FromSeconds(Math.Max(1, capped + jitter));
     }
 

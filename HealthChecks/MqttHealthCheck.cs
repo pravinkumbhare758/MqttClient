@@ -7,16 +7,20 @@ namespace MqttClient.HealthChecks;
 public sealed class MqttHealthCheck : IHealthCheck
 {
     private readonly MqttConnectionState _state;
-    private readonly WorkerPoolOptions _opts;
+    // IOptionsMonitor so the threshold reflects hot-reloaded config,
+    // not the snapshot captured at construction time.
+    private readonly IOptionsMonitor<WorkerPoolOptions> _opts;
 
-    public MqttHealthCheck(MqttConnectionState state, IOptions<WorkerPoolOptions> opts)
+    public MqttHealthCheck(MqttConnectionState state, IOptionsMonitor<WorkerPoolOptions> opts)
     {
         _state = state;
-        _opts  = opts.Value;
+        _opts  = opts;
     }
 
     public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken ct)
     {
+        var opts = _opts.CurrentValue;
+
         var data = new Dictionary<string, object>
         {
             ["connected"]        = _state.IsConnected,
@@ -27,7 +31,7 @@ public sealed class MqttHealthCheck : IHealthCheck
         if (!_state.IsConnected)
             return Task.FromResult(HealthCheckResult.Unhealthy("MQTT broker disconnected", data: data));
 
-        if (_state.ChannelFillPercent >= _opts.BackpressureHighWatermarkPercent)
+        if (_state.ChannelFillPercent >= opts.BackpressureHighWatermarkPercent)
             return Task.FromResult(HealthCheckResult.Degraded("Channel near capacity", data: data));
 
         return Task.FromResult(HealthCheckResult.Healthy(data: data));
@@ -36,12 +40,11 @@ public sealed class MqttHealthCheck : IHealthCheck
 
 /// <summary>
 /// Shared state between MqttConsumerService and the health check.
-/// All writes use Interlocked/volatile to guarantee cross-thread visibility
-/// without taking a lock on the hot path.
+/// All writes use Interlocked/volatile to guarantee cross-thread visibility.
 /// </summary>
 public sealed class MqttConnectionState
 {
-    private volatile int _isConnected;        // 0 = false, 1 = true
+    private volatile int _isConnected;
     private volatile int _channelFillPercent;
     private volatile int _activeWorkers;
 
