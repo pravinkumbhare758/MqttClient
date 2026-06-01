@@ -257,11 +257,12 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         {
             await foreach (var message in _channel.Reader.ReadAllAsync(CancellationToken.None))
             {
-                if (Volatile.Read(ref _activeWorkerCount) > Volatile.Read(ref _targetWorkerCount))
-                    break;
-
                 await ProcessMessageAsync(message, _stoppingToken).ConfigureAwait(false);
                 UpdateChannelMetrics();
+
+                // Check scale-down AFTER processing so we never discard a dequeued message.
+                if (Volatile.Read(ref _activeWorkerCount) > Volatile.Read(ref _targetWorkerCount))
+                    break;
             }
         }
         finally
@@ -308,6 +309,12 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         }
         catch (BrokenCircuitException bcx)
         {
+            sw.Stop();
+            var bcxTags = new TagList { { "topic", message.Topic } };
+            _metrics.MessagesDeadLettered.Add(1, bcxTags);
+            _metrics.ProcessingLatencyMs.Record(sw.Elapsed.TotalMilliseconds, bcxTags);
+            _metrics.EndToEndLatencyMs.Record(
+                (DateTimeOffset.UtcNow - message.ReceivedAt).TotalMilliseconds, bcxTags);
             processActivity?.RecordException(bcx);
             _logger.LogWarning(bcx, "Circuit open for topic {Topic}, routing to dead-letter",
                 message.Topic);
@@ -316,7 +323,9 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
         catch (Exception ex)
         {
             sw.Stop();
-            _metrics.MessagesFailed.Add(1, new TagList { { "topic", message.Topic } });
+            var tags = new TagList { { "topic", message.Topic } };
+            _metrics.MessagesFailed.Add(1, tags);
+            _metrics.MessagesDeadLettered.Add(1, tags);
             processActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             processActivity?.RecordException(ex);
             await SendToDeadLetterAsync(message, ex, "max-retries-exceeded");

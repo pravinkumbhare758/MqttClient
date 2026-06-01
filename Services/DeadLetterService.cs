@@ -23,10 +23,11 @@ public sealed class DeadLetterService : IAsyncDisposable
 
     public ValueTask EnqueueAsync(DeadLetterMessage message)
     {
-        // Writer may be completed after DisposeAsync; swallow the closed-channel exception
-        // so callers don't crash during a tight shutdown race.
-        if (_channel.Writer.TryWrite(message)) return ValueTask.CompletedTask;
-        return _channel.Writer.WriteAsync(message);
+        // TryWrite returns false only when the channel is closed (shutdown race) or DropOldest
+        // silently evicted the oldest entry. Both are acceptable — WriteAsync would throw
+        // ChannelClosedException on a closed channel, so we never fall through to it.
+        _channel.Writer.TryWrite(message);
+        return ValueTask.CompletedTask;
     }
 
     private async Task DrainAsync()
