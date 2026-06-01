@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Options;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
 using HealthChecks.UI.Client;
@@ -15,38 +16,45 @@ using MqttClient.Tracing;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ── Configuration (Step 7) ───────────────────────────────────────────────────
-builder.Services.Configure<MqttOptions>(builder.Configuration.GetSection(MqttOptions.Section));
-builder.Services.Configure<WorkerPoolOptions>(builder.Configuration.GetSection(WorkerPoolOptions.Section));
+// ── Configuration with startup validation ────────────────────────────────────
+builder.Services
+    .AddOptions<MqttOptions>()
+    .BindConfiguration(MqttOptions.Section)
+    .ValidateOnStart();
 
-// ── Message Handlers (Step 9 – pre-compiled router) ─────────────────────────
+builder.Services
+    .AddOptions<WorkerPoolOptions>()
+    .BindConfiguration(WorkerPoolOptions.Section)
+    .ValidateOnStart();
+
+// IValidateOptions implementations — called by ValidateOnStart above
+builder.Services.AddSingleton<IValidateOptions<MqttOptions>, MqttOptionsValidator>();
+builder.Services.AddSingleton<IValidateOptions<WorkerPoolOptions>, WorkerPoolOptionsValidator>();
+
+// ── Message Handlers ──────────────────────────────────────────────────────────
+// Register all IMqttMessageHandler implementations before TopicRouter so the
+// IEnumerable<IMqttMessageHandler> constructor parameter is populated.
 builder.Services.AddSingleton<IMqttMessageHandler, TelemetryHandler>();
 builder.Services.AddSingleton<IMqttMessageHandler, CommandHandler>();
 builder.Services.AddSingleton<ITopicRouter, TopicRouter>();
 
-// ── Core services ────────────────────────────────────────────────────────────
+// ── Core services ─────────────────────────────────────────────────────────────
 builder.Services.AddSingleton<DeadLetterService>();
 builder.Services.AddSingleton<MqttConnectionState>();
 builder.Services.AddSingleton<MqttMetrics>();
 builder.Services.AddHostedService<MqttConsumerService>();
 
-// ── OpenTelemetry – Metrics & Traces (Steps 3 & 10) ─────────────────────────
+// ── OpenTelemetry — Metrics & Traces ─────────────────────────────────────────
 builder.Services.AddOpenTelemetry()
-    .WithMetrics(metrics =>
-    {
-        metrics
-            .AddMeter(MqttMetrics.MeterName)
-            .AddRuntimeInstrumentation()
-            .AddPrometheusExporter();
-    })
-    .WithTracing(tracing =>
-    {
-        tracing
-            .AddSource(MqttActivitySource.Source.Name)
-            .AddOtlpExporter();   // configure OTEL_EXPORTER_OTLP_ENDPOINT env var
-    });
+    .WithMetrics(metrics => metrics
+        .AddMeter(MqttMetrics.MeterName)
+        .AddRuntimeInstrumentation()
+        .AddPrometheusExporter())
+    .WithTracing(tracing => tracing
+        .AddSource(MqttActivitySource.Source.Name)
+        .AddOtlpExporter());   // set OTEL_EXPORTER_OTLP_ENDPOINT env var
 
-// ── Health Checks (Step 3) ───────────────────────────────────────────────────
+// ── Health checks ─────────────────────────────────────────────────────────────
 builder.Services.AddHealthChecks()
     .AddCheck<MqttHealthCheck>(
         "mqtt",
@@ -55,10 +63,8 @@ builder.Services.AddHealthChecks()
 
 var app = builder.Build();
 
-// ── Prometheus scrape endpoint ────────────────────────────────────────────────
 app.MapPrometheusScrapingEndpoint("/metrics");
 
-// ── Health endpoints ──────────────────────────────────────────────────────────
 app.MapHealthChecks("/health/live", new HealthCheckOptions
 {
     Predicate      = hc => hc.Tags.Contains("live"),

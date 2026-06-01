@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace MqttClient.Models;
 
 public sealed record MqttMessage(
@@ -7,5 +9,6 @@ public sealed record MqttMessage(
     bool Retain,
     string CorrelationId,
     DateTimeOffset ReceivedAt,
-    System.Diagnostics.Activity? ParentActivity,
-    int RetryCount = 0);
+    // Store the struct (not the Activity object) so the parent span context
+    // remains valid after OnMessageReceivedAsync disposes the receive activity.
+    ActivityContext ParentContext);

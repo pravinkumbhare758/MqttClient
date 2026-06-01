@@ -9,44 +9,51 @@ public sealed class DeadLetterService : IAsyncDisposable
     private readonly Channel<DeadLetterMessage> _channel;
     private readonly ILogger<DeadLetterService> _logger;
     private readonly Task _drainTask;
-    private readonly CancellationTokenSource _cts = new();
 
     public DeadLetterService(ILogger<DeadLetterService> logger)
     {
         _logger = logger;
         _channel = Channel.CreateBounded<DeadLetterMessage>(new BoundedChannelOptions(1_000)
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
+            FullMode     = BoundedChannelFullMode.DropOldest,
             SingleReader = true
         });
-        _drainTask = DrainAsync(_cts.Token);
+        _drainTask = DrainAsync();
     }
 
-    public ValueTask EnqueueAsync(DeadLetterMessage message) =>
-        _channel.Writer.WriteAsync(message);
-
-    private async Task DrainAsync(CancellationToken ct)
+    public ValueTask EnqueueAsync(DeadLetterMessage message)
     {
-        await foreach (var msg in _channel.Reader.ReadAllAsync(ct))
+        // Writer may be completed after DisposeAsync; swallow the closed-channel exception
+        // so callers don't crash during a tight shutdown race.
+        if (_channel.Writer.TryWrite(message)) return ValueTask.CompletedTask;
+        return _channel.Writer.WriteAsync(message);
+    }
+
+    private async Task DrainAsync()
+    {
+        // ReadAllAsync(CancellationToken.None): drains ALL queued items before exiting,
+        // even if the writer is completed. This ensures DLC messages are never lost.
+        await foreach (var msg in _channel.Reader.ReadAllAsync(CancellationToken.None))
         {
             _logger.LogError(
                 msg.Exception,
-                "Dead-letter: topic={Topic} correlationId={CorrelationId} reason={Reason} retries={Retries} failedAt={FailedAt}",
+                "Dead-letter: topic={Topic} correlationId={CorrelationId} reason={Reason} failedAt={FailedAt}",
                 msg.OriginalMessage.Topic,
                 msg.OriginalMessage.CorrelationId,
                 msg.Reason,
-                msg.OriginalMessage.RetryCount,
                 msg.FailedAt);
 
-            // TODO: persist to external store (e.g., Redis, MQTT topic, file)
+            // TODO: persist to external store (e.g., Redis, dedicated MQTT topic, file)
         }
     }
 
     public async ValueTask DisposeAsync()
     {
+        // 1. Signal no more writes — DrainAsync will process remaining items and then exit.
         _channel.Writer.TryComplete();
-        await _cts.CancelAsync();
-        try { await _drainTask; } catch (OperationCanceledException) { }
-        _cts.Dispose();
+
+        // 2. Wait for all items to drain (no timeout: DLC flush is part of graceful shutdown).
+        try { await _drainTask.ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
     }
 }

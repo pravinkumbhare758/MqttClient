@@ -15,12 +15,14 @@ public static class MqttActivitySource
         return activity;
     }
 
-    public static Activity? StartProcess(string topic, string correlationId, Activity? parent)
+    // Accepts ActivityContext (a struct) so the caller does not need to keep
+    // the parent Activity alive — the context is self-contained after capture.
+    public static Activity? StartProcess(string topic, string correlationId, ActivityContext parentContext)
     {
         var activity = Source.StartActivity(
             "mqtt.process",
             ActivityKind.Internal,
-            parent?.Context ?? default);
+            parentContext);
         activity?.SetTag("messaging.system", "mqtt");
         activity?.SetTag("messaging.destination", topic);
         activity?.SetTag("messaging.correlation_id", correlationId);

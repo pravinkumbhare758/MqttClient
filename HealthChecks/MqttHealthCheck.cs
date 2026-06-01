@@ -34,10 +34,32 @@ public sealed class MqttHealthCheck : IHealthCheck
     }
 }
 
-/// <summary>Shared mutable state updated by the consumer service.</summary>
+/// <summary>
+/// Shared state between MqttConsumerService and the health check.
+/// All writes use Interlocked/volatile to guarantee cross-thread visibility
+/// without taking a lock on the hot path.
+/// </summary>
 public sealed class MqttConnectionState
 {
-    public bool IsConnected { get; set; }
-    public int ChannelFillPercent { get; set; }
-    public int ActiveWorkers { get; set; }
+    private volatile int _isConnected;        // 0 = false, 1 = true
+    private volatile int _channelFillPercent;
+    private volatile int _activeWorkers;
+
+    public bool IsConnected
+    {
+        get => _isConnected == 1;
+        set => Interlocked.Exchange(ref _isConnected, value ? 1 : 0);
+    }
+
+    public int ChannelFillPercent
+    {
+        get => Volatile.Read(ref _channelFillPercent);
+        set => Interlocked.Exchange(ref _channelFillPercent, value);
+    }
+
+    public int ActiveWorkers
+    {
+        get => Volatile.Read(ref _activeWorkers);
+        set => Interlocked.Exchange(ref _activeWorkers, value);
+    }
 }
