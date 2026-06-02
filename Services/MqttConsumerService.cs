@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Diagnostics;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Channels;
@@ -46,7 +47,10 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
     private Task _scalerTask = Task.CompletedTask;
 
     // ── Resilience pipelines ──────────────────────────────────────────────────
-    private readonly Dictionary<string, ResiliencePipeline> _pipelines = new();
+    // Built once in the constructor, then read on every message — frozen for the
+    // fastest possible read path on an immutable lookup.
+    private FrozenDictionary<string, ResiliencePipeline> _pipelines =
+        FrozenDictionary<string, ResiliencePipeline>.Empty;
     private static readonly ResiliencePropertyKey<string> TopicKey = new("mqtt.topic");
 
     // ── MQTT client ───────────────────────────────────────────────────────────
@@ -506,9 +510,14 @@ public sealed class MqttConsumerService : BackgroundService, IAsyncDisposable
                 })
                 .Build();
 
-        _pipelines["__default__"] = Build("__default__");
+        var pipelines = new Dictionary<string, ResiliencePipeline>
+        {
+            ["__default__"] = Build("__default__")
+        };
         foreach (var filter in _router.RegisteredFilters)
-            _pipelines[filter] = Build(filter);
+            pipelines[filter] = Build(filter);
+
+        _pipelines = pipelines.ToFrozenDictionary();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
